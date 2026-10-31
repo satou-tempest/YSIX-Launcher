@@ -1,0 +1,206 @@
+name: Build YS IX v1.1 Shader Discovery and Vulkan Diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ARM64 Ys IX Native Runtime APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout YSIX repository
+        uses: actions/checkout@v7
+
+      - name: Extract v1.1 source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f YSIX-Launcher-v1.1-source.zip
+          mkdir -p project
+          unzip -q YSIX-Launcher-v1.1-source.zip -d project
+          ROOT="project/ysix-launcher-v1.1"
+          test -f "$ROOT/tools/runtime-bridge/patch_p5r_runtime.py"
+          test -f "$ROOT/app/src/main/java/io/github/ysix/launcher/GameActivity.java"
+          echo "YSIX_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Fetch pinned MIT-licensed generic Switch importer for the pre-boot diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="$YSIX_ROOT/third_party/p5r-android/android/wonder/importer"
+          BASE="https://raw.githubusercontent.com/Brandon04Gonzalez/p5r-android/645c717afbc0610f9da38b0cc1d6834820ffa76a"
+          mkdir -p "$DEST" "$YSIX_ROOT/third_party/p5r-android"
+          for FILE in nximport.cpp nximport.h nxcrypto.cpp nxcrypto.h nxgame.h; do
+            curl --fail --location --retry 3 "$BASE/android/wonder/importer/$FILE" -o "$DEST/$FILE"
+          done
+          curl --fail --location --retry 3 "$BASE/LICENSE" -o "$YSIX_ROOT/third_party/p5r-android/LICENSE"
+          test -s "$DEST/nximport.cpp"
+          test -s "$DEST/nxcrypto.cpp"
+
+      - name: Clone pinned MIT-licensed native runtime reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="$RUNNER_TEMP/p5r-android"
+          git clone --filter=blob:none --no-checkout https://github.com/Brandon04Gonzalez/p5r-android.git "$REF"
+          git -C "$REF" checkout --detach 645c717afbc0610f9da38b0cc1d6834820ffa76a
+          test "$(git -C "$REF" rev-parse HEAD)" = "645c717afbc0610f9da38b0cc1d6834820ffa76a"
+          grep -Fq 'NX_SHOW_FPS=1' "$REF/runtime/src/nvn/nvn_present.cpp"
+          grep -Fq 'shapes[count++]' "$REF/runtime/src/nvn/nvn_present.cpp"
+          python3 "$YSIX_ROOT/tools/runtime-bridge/patch_p5r_runtime.py" \
+            --root "$REF" \
+            --game-source "$YSIX_ROOT/tools/runtime-bridge/ysix_game.cpp"
+          mkdir -p "$YSIX_ROOT/app/src/main/assets/THIRD_PARTY_LICENSES"
+          cp "$REF/LICENSE" "$YSIX_ROOT/app/src/main/assets/THIRD_PARTY_LICENSES/P5R-Android-MIT.txt"
+          echo "P5R_RUNTIME_ROOT=$REF" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK and NDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android build components
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libzstd-dev zlib1g-dev
+          cmake --version
+          python3 - <<'PY'
+          import re, subprocess
+          v = subprocess.check_output(["cmake", "--version"], text=True).splitlines()[0]
+          nums = tuple(map(int, re.search(r"([0-9]+)\.([0-9]+)\.([0-9]+)", v).groups()))
+          assert nums >= (3, 25, 0), f"P5R runtime needs CMake >= 3.25, found {nums}"
+          PY
+
+      - name: Run v1.1 shader discovery, VFS3, loader and relocation regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$YSIX_ROOT"
+          bash tests/check_v11_shader_source.sh
+
+      - name: Build ARM64 Zstandard decoder for VFS3 shader-asset scanning
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/28.2.13676358"
+          ZSTD_ROOT="$RUNNER_TEMP/zstd-1.5.7"
+          ZSTD_BUILD="$RUNNER_TEMP/zstd-android-build"
+          ZSTD_INSTALL="$RUNNER_TEMP/zstd-android-install"
+          git clone --depth 1 --branch v1.5.7 https://github.com/facebook/zstd.git "$ZSTD_ROOT"
+          mkdir -p "$YSIX_ROOT/app/src/main/assets/THIRD_PARTY_LICENSES"
+          cp "$ZSTD_ROOT/LICENSE" "$YSIX_ROOT/app/src/main/assets/THIRD_PARTY_LICENSES/Zstandard-LICENSE.txt"
+          cmake -S "$ZSTD_ROOT/build/cmake" -B "$ZSTD_BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$ZSTD_INSTALL" -DCMAKE_INSTALL_LIBDIR=lib \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 -DANDROID_STL=c++_static \
+            -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON \
+            -DZSTD_BUILD_PROGRAMS=OFF -DZSTD_BUILD_TESTS=OFF -DZSTD_BUILD_CONTRIB=OFF \
+            -DZSTD_BUILD_DICTBUILDER=OFF -DZSTD_MULTITHREAD_SUPPORT=OFF
+          cmake --build "$ZSTD_BUILD" --parallel 2
+          cmake --install "$ZSTD_BUILD"
+          test -s "$ZSTD_INSTALL/include/zstd.h"
+          test -s "$ZSTD_INSTALL/lib/libzstd.a"
+          echo "YSIX_ZSTD_INCLUDE_DIR=$ZSTD_INSTALL/include" >> "$GITHUB_ENV"
+          echo "YSIX_ZSTD_LIBRARY=$ZSTD_INSTALL/lib/libzstd.a" >> "$GITHUB_ENV"
+
+      - name: Install Vulkan-Headers 1.4.357 for the generated Vulkan bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEADERS="$RUNNER_TEMP/Vulkan-Headers-1.4.357"
+          SDK="$RUNNER_TEMP/VulkanSDK"
+          git clone --depth 1 --branch v1.4.357 https://github.com/KhronosGroup/Vulkan-Headers.git "$HEADERS"
+          mkdir -p "$SDK"
+          ln -s "$HEADERS/include" "$SDK/Include"
+          test -f "$SDK/Include/vulkan/vulkan.h"
+          test -f "$SDK/Include/vulkan/vulkan_core.h"
+          echo "VULKAN_SDK=$SDK" >> "$GITHUB_ENV"
+          echo "Using Vulkan-Headers v1.4.357 from $SDK/Include"
+
+      - name: Build ARM64 Ryujinx Maxwell-to-SPIR-V shader translator
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="$P5R_RUNTIME_ROOT"
+          mkdir -p "$REF/private/third_party/ryubing"
+          curl --fail --location --retry 3 \
+            https://codeberg.org/Software_arch/Ryubing/archive/a82350bb77.tar.gz \
+            -o "$RUNNER_TEMP/ryubing-a82350bb77.tar.gz"
+          tar -xzf "$RUNNER_TEMP/ryubing-a82350bb77.tar.gz" \
+            -C "$REF/private/third_party/ryubing" --strip-components=1
+          test -s "$REF/private/third_party/ryubing/LICENSE.txt"
+          cp "$REF/private/third_party/ryubing/LICENSE.txt" \
+            "$YSIX_ROOT/app/src/main/assets/THIRD_PARTY_LICENSES/Ryubing-Ryujinx-MIT.txt"
+          if test -s "$REF/private/third_party/ryubing/THIRDPARTY.md"; then
+            cp "$REF/private/third_party/ryubing/THIRDPARTY.md" \
+              "$YSIX_ROOT/app/src/main/assets/THIRD_PARTY_LICENSES/Ryubing-THIRDPARTY.md"
+          fi
+          docker run --rm -v "$REF:/src" -w /src \
+            mcr.microsoft.com/dotnet/sdk:10.0 \
+            sh games/p5r/tools/build_harness_android.sh
+          HARNESS="$REF/private/build/spirv_harness_android/libspirvharness.so"
+          test -s "$HARNESS"
+          mkdir -p "$YSIX_ROOT/app/src/main/jniLibs/arm64-v8a"
+          cp "$HARNESS" "$YSIX_ROOT/app/src/main/jniLibs/arm64-v8a/libspirvharness.so"
+          "$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            -h "$YSIX_ROOT/app/src/main/jniLibs/arm64-v8a/libspirvharness.so" | grep -E 'AArch64|ELF64'
+
+      - name: Build generic ARM64 NCE runtime for Ys IX
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="$P5R_RUNTIME_ROOT"
+          NDK="$ANDROID_HOME/ndk/28.2.13676358"
+          cmake -S "$REF" -B "$RUNNER_TEMP/ysix-nce-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-29 \
+            -DANDROID_STL=c++_static \
+            -DNX_VULKAN_SDK="$VULKAN_SDK" \
+            -DNX_GAME=ysix \
+            -DNX_NCE=ON \
+            -DNX_RELEASE=OFF
+          cmake --build "$RUNNER_TEMP/ysix-nce-build" --target ysix --parallel 2
+          test -s "$RUNNER_TEMP/ysix-nce-build/libysix.so"
+          mkdir -p "$YSIX_ROOT/app/src/main/jniLibs/arm64-v8a"
+          cp "$RUNNER_TEMP/ysix-nce-build/libysix.so" "$YSIX_ROOT/app/src/main/jniLibs/arm64-v8a/libysix.so"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -h "$YSIX_ROOT/app/src/main/jniLibs/arm64-v8a/libysix.so" | grep -E 'AArch64|ELF64'
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK (NCE runtime + full game shader scan + VFS3 decompression + Vulkan diagnostics)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$YSIX_ROOT"
+          gradle --no-daemon --stacktrace :app:assembleDebug
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          unzip -l "$APK" | grep 'lib/arm64-v8a/libysix.so'
+          unzip -l "$APK" | grep 'lib/arm64-v8a/libysixprobe.so'
+          unzip -l "$APK" | grep 'lib/arm64-v8a/libspirvharness.so'
+
+      - name: Upload v1.1 experimental shader-discovery debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: ysix-v1.1-shader-discovery-debug-apk
+          path: ${{ env.YSIX_ROOT }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
